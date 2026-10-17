@@ -38,6 +38,11 @@ if ($Uninstall) {
             Write-Host "Removed $assetPath"
         }
     }
+    $assetTemplates = Join-Path $destAssets "node-templates"
+    if (Test-Path -LiteralPath $assetTemplates) {
+        Remove-Item -LiteralPath $assetTemplates -Recurse -Force
+        Write-Host "Removed $assetTemplates"
+    }
     Write-Host "Restart DaVinci Resolve to unregister ColorFlow."
     return
 }
@@ -74,6 +79,15 @@ foreach ($asset in @("lut_reference_480x270.rgb", "lut_reference.png")) {
     if (Test-Path -LiteralPath $assetSource) {
         Copy-Item -LiteralPath $assetSource -Destination $destAssets -Force
     }
+}
+$assetNodeTemplates = Join-Path (Join-Path $sourceRoot "assets") "node-templates"
+if (Test-Path -LiteralPath $assetNodeTemplates) {
+    $destNodeTemplates = Join-Path $destAssets "node-templates"
+    New-Item -ItemType Directory -Path $destNodeTemplates -Force | Out-Null
+    Get-ChildItem -LiteralPath $assetNodeTemplates -File |
+        ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $destNodeTemplates -Force
+        }
 }
 
 Write-Host ""

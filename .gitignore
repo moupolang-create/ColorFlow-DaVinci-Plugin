@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+tests/*.log
+tests/*.png
+tests/*.jpg
+

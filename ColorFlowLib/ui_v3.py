@@ -319,6 +319,7 @@ class ColorFlowApp(V2App):
             for widget_id in (
                 "build_status",
                 "tree_status",
+                "restore_progress",
                 "primary_status",
                 "lut_status",
                 "match_status",
@@ -1364,6 +1365,14 @@ class ColorFlowApp(V2App):
                         self.ui.Button({"ID": "btn_reset", "Text": "还原原始（清空）", "MinimumSize": [150, 32]}),
                     ],
                 ),
+                self.ui.Label(
+                    {
+                        "ID": "restore_progress",
+                        "Text": "",
+                        "MaximumSize": [880, 24],
+                        "StyleSheet": "font-family:Consolas,Menlo,monospace;color:#22d3ee;",
+                    }
+                ),
                 self.ui.Label({
                     "Text": "分节点顺序：01 降噪 → 02 曝光 → 03 色温 → 04 饱和 → 最后空白节点留给匹配",
                     "WordWrap": True,
@@ -2075,103 +2084,250 @@ class ColorFlowApp(V2App):
             )
             self._log("单节点兼容还原失败：%s" % exc)
 
-    @_guarded
-    def on_split_restore(self, event):
+    def _set_restore_progress(
+        self, current, total, name="", completed=None, color="#22d3ee"
+    ):
+        total = max(1, int(total))
+        current = max(0, min(int(current), total))
+        if completed is None:
+            completed = max(0, current - 1)
+        completed = max(0, min(int(completed), total))
+        slots = 24
+        filled = int(round(slots * completed / total))
+        bar = "█" * filled + "░" * (slots - filled)
+        label = self._t("还原进度", "Restore")
+        text = "%s  %s  %d/%d" % (label, bar, current, total)
+        if name:
+            text += " · %s" % name
+        self._set("restore_progress", text, color)
+
+    def _restore_single_clip(self, context, clip, strength, space_key):
+        capture = rb.capture_item_thumbnail(context["timeline"], clip)
+        model = analysis.restore_model(
+            capture["stats"], strength, True
+        )
+        node_index = features.auto_node_index(clip, "primary")
+        backup, _ = self._backup(clip, "单节点还原前")
         try:
-            context = self._require_clip()
-            clip = context["clip"]
-            project = context["project"]
-            nodes = self._nodes(clip)
-            backup = None
-            version = None
-            template = features.find_template()
-            template_used = None
-            use_template = bool(template)
-            if use_template:
-                backup, version = self._backup(clip, "分节点还原前")
-                try:
-                    features.apply_template(
-                        project, clip, template, label_nodes=True
-                    )
-                    template_used = os.path.basename(template)
-                except Exception:
-                    self._restore_on_failure(clip, backup)
-                    raise
+            features.apply_model(
+                context["project"],
+                clip,
+                node_index,
+                model,
+                space_key,
+                "单节点还原-%s" % clip.GetName(),
+            )
+        except Exception:
+            self._restore_on_failure(clip, backup)
+            raise
+        return {
+            "single": True,
+            "model": model,
+            "node": {"index": node_index},
+        }
+
+    def _restore_clip_split(
+        self, context, clip, template, strength, space_key
+    ):
+        project = context["project"]
+        nodes = self._nodes(clip)
+        if template:
+            backup, _ = self._backup(clip, "分节点还原前")
+            try:
+                features.apply_template(
+                    project, clip, template, label_nodes=True
+                )
                 nodes = self._nodes(clip)
                 if len(nodes) < 5:
                     self._restore_on_failure(clip, backup)
-                    self._log(
-                        "模板 %s 节点数仍少于 5，回退单节点兼容还原。"
-                        % os.path.basename(template)
+                    return self._restore_single_clip(
+                        context, clip, strength, space_key
                     )
-                    return self._single_node_restore_impl(event)
-                self._log("已套用节点模板：%s（%d 节点）" % (template_used, len(nodes)))
-            elif len(nodes) < 5:
-                self._log("未找到可用节点模板，使用单节点兼容还原。")
-                return self._single_node_restore_impl(event)
-            else:
-                backup, version = self._backup(clip, "分节点还原前")
-
-            capture = rb.capture_item_thumbnail(
-                context["timeline"], clip
+                capture = rb.capture_item_thumbnail(
+                    context["timeline"], clip
+                )
+                stats = capture["stats"]
+                writes = [
+                    (
+                        2,
+                        analysis.exposure_model(stats, strength),
+                        "02-exposure",
+                    ),
+                    (
+                        3,
+                        analysis.white_balance_model(stats, strength),
+                        "03-temperature",
+                    ),
+                    (
+                        4,
+                        analysis.saturation_model(stats, strength, True),
+                        "04-saturation",
+                    ),
+                ]
+                for node_index, model, label in writes:
+                    features.apply_model(
+                        project, clip, node_index, model, space_key, label
+                    )
+                return {
+                    "single": False,
+                    "writes": writes,
+                    "nodes": len(nodes),
+                    "stats": stats,
+                }
+            except Exception:
+                self._restore_on_failure(clip, backup)
+                raise
+        if len(nodes) < 5:
+            return self._restore_single_clip(
+                context, clip, strength, space_key
             )
+        backup, _ = self._backup(clip, "分节点还原前")
+        try:
+            capture = rb.capture_item_thumbnail(context["timeline"], clip)
             stats = capture["stats"]
-            strength = self._strength("primary_strength")
-            space_key, _ = self._space(context)
             writes = [
                 (2, analysis.exposure_model(stats, strength), "02-exposure"),
-                (3, analysis.white_balance_model(stats, strength), "03-temperature"),
+                (
+                    3,
+                    analysis.white_balance_model(stats, strength),
+                    "03-temperature",
+                ),
                 (
                     4,
                     analysis.saturation_model(stats, strength, True),
                     "04-saturation",
                 ),
             ]
-            try:
-                for node_index, model, label in writes:
-                    features.apply_model(
-                        project, clip, node_index, model, space_key, label
-                    )
-            except Exception:
-                self._restore_on_failure(clip, backup)
-                raise
+            for node_index, model, label in writes:
+                features.apply_model(
+                    project, clip, node_index, model, space_key, label
+                )
+            return {
+                "single": False,
+                "writes": writes,
+                "nodes": len(nodes),
+                "stats": stats,
+            }
+        except Exception:
+            self._restore_on_failure(clip, backup)
+            raise
 
-            self._log(
-                "一键还原（分节点）：%s｜模板 %s｜02曝光 %+.2fEV｜03色温 R/G %+.3f B/G %+.3f｜"
-                "04饱和 %.3f / 对比 %.3f｜最后空白节点保留给匹配"
-                % (
-                    clip.GetName(),
-                    template_used or "沿用当前节点链",
-                    writes[0][1]["exposure_stops"],
-                    writes[1][1]["wb_rg"],
-                    writes[1][1]["wb_bg"],
-                    writes[2][1]["saturation"],
-                    writes[2][1]["contrast"],
-                )
+    @_guarded
+    def on_split_restore(self, event):
+        try:
+            context = self._require_clip()
+            scope = self._scope("restore_scope")
+            context, items = self._target_items(scope)
+            total = len(items)
+            if not total:
+                raise rb.ColorFlowError("还原范围内没有视频镜头。")
+            template = features.find_template()
+            template_used = (
+                os.path.basename(template) if template else None
             )
-            self.refresh_analysis()
-            self.result_preview = getattr(self, "target_preview", None)
-            self._update_match_visual()
-            template_note = (
-                self._t(
-                    "模板 %s，" % template_used,
-                    " with template %s, " % template_used,
-                )
-                if template_used
-                else ""
+            strength = self._strength("primary_strength")
+            space_key, _ = self._space(context)
+            self.last_backups = []
+            successes = 0
+            singles = 0
+            failures = []
+            self._set_restore_progress(
+                0, total, self._t("准备…", "Preparing…"), completed=0
             )
-            self._set(
-                "primary_status",
-                self._t(
-                    "一键还原（分节点）完成：%s02 曝光 / 03 色温 / 04 饱和；"
-                    "01 降噪和最后空白节点未写入。",
-                    "Split restore complete%s: 02 Exposure / 03 Temperature / "
-                    "04 Saturation; 01 Denoise and last blank untouched.",
+            self.pump()
+            for index, item in enumerate(items, 1):
+                if self._cancel_requested:
+                    break
+                name = item.GetName()
+                self._set_restore_progress(
+                    index,
+                    total,
+                    self._t("正在还原：%s", "Restoring: %s") % name,
+                    completed=index - 1,
                 )
-                % template_note,
-                "#6ee7b7",
+                self.pump()
+                try:
+                    result = self._restore_clip_split(
+                        context, item, template, strength, space_key
+                    )
+                    successes += 1
+                    if result["single"]:
+                        singles += 1
+                        self._log(
+                            "单节点兼容还原：%s｜节点 %02d｜%s"
+                            % (
+                                name,
+                                result["node"]["index"],
+                                analysis.describe_model(result["model"]),
+                            )
+                        )
+                    else:
+                        writes = result["writes"]
+                        self._log(
+                            "一键还原：%s｜模板 %s｜02曝光 %+.2fEV｜"
+                            "03色温 R/G %+.3f B/G %+.3f｜"
+                            "04饱和 %.3f / 对比 %.3f｜最后空白节点保留给匹配"
+                            % (
+                                name,
+                                template_used or "沿用当前节点链",
+                                writes[0][1]["exposure_stops"],
+                                writes[1][1]["wb_rg"],
+                                writes[1][1]["wb_bg"],
+                                writes[2][1]["saturation"],
+                                writes[2][1]["contrast"],
+                            )
+                        )
+                except Exception as exc:
+                    failures.append((name, str(exc)))
+                    self._log("一键还原失败：%s：%s" % (name, exc))
+                self._set_restore_progress(
+                    index,
+                    total,
+                    self._t("已完成：%s", "Finished: %s") % name,
+                    completed=index,
+                )
+                self.pump()
+            self._save(context)
+            try:
+                self.refresh_analysis()
+                self.result_preview = getattr(
+                    self, "target_preview", None
+                )
+                self._update_match_visual()
+            except Exception:
+                pass
+            color = "#f87171" if failures else "#6ee7b7"
+            status = self._t(
+                "一键还原完成：%d/%d 个镜头",
+                "Restore complete: %d/%d clips",
+            ) % (successes, total)
+            if singles:
+                status += self._t(
+                    "，单节点回退 %d 个", ", %d single-node fallback"
+                ) % singles
+            if template_used:
+                status += self._t(
+                    "；模板 %s", "; template %s"
+                ) % template_used
+            if failures:
+                status += self._t(
+                    "；失败 %d 个（%s）",
+                    "; %d failed (%s)",
+                ) % (len(failures), failures[0][1])
+            self._set_restore_progress(
+                total,
+                total,
+                self._t("完成", "Done")
+                if not failures
+                else self._t("完成，有失败", "Done with failures"),
+                completed=total,
+                color=color,
             )
+            self._set("primary_status", status, color)
         except Exception as exc:
+            self._set_restore_progress(
+                0, 1, self._t("失败", "Failed"), completed=0, color="#f87171"
+            )
             self._set(
                 "primary_status",
                 self._t(

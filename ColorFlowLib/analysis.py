@@ -232,6 +232,34 @@ def _neutral_confidence(stats):
     return clamp(stats.get("neutral_ratio", 0.0) / 0.06, 0.30, 1.0)
 
 
+def _tone_restore_factors(stats):
+    """Adaptive contrast/saturation lift for flat log or grey footage."""
+    contrast_stops = max(_finite(stats.get("contrast_stops"), 4.0), 0.20)
+    saturation = max(_finite(stats.get("saturation"), 0.20), 0.03)
+    # A flat image needs a stronger lift. Either low contrast or very low
+    # saturation can indicate log/grey footage, so use the stronger cue.
+    contrast_flatness = clamp(
+        (3.8 - contrast_stops) / 1.8, 0.0, 1.0
+    )
+    saturation_flatness = clamp(
+        (0.14 - saturation) / 0.10, 0.0, 1.0
+    )
+    flatness = max(contrast_flatness, saturation_flatness)
+    if flatness <= 1e-4:
+        return 1.0, 1.0, 0.0
+    contrast = clamp(
+        7.0 / contrast_stops,
+        1.0,
+        1.60 + 1.00 * flatness,
+    )
+    saturation = clamp(
+        0.26 / saturation,
+        1.0,
+        1.30 + 0.70 * flatness,
+    )
+    return contrast, saturation, flatness
+
+
 def restore_model(stats, strength=0.70, restore_tone=False):
     """Build a neutralising model that removes a cast and normalises exposure."""
     strength = clamp(_finite(strength, 0.70), 0.0, 1.0)
@@ -243,21 +271,16 @@ def restore_model(stats, strength=0.70, restore_tone=False):
     white_bg = clamp(-_finite(stats.get("bg")), -0.30, 0.30)
     contrast = 1.0
     saturation = 1.0
+    tone_strength = strength
+    black, white, stretch = 0.0, 1.0, 0.0
     if (
         restore_tone
         and _finite(stats.get("p85"), 0.0) > 0.02
         and _finite(stats.get("contrast_stops"), 0.0) > 0.20
     ):
-        contrast = clamp(
-            4.0 / max(_finite(stats.get("contrast_stops"), 4.0), 2.0),
-            1.0,
-            1.28,
-        )
-        saturation = clamp(
-            0.22 / max(_finite(stats.get("saturation"), 0.22), 0.05),
-            1.0,
-            1.22,
-        )
+        contrast, saturation, flatness = _tone_restore_factors(stats)
+        if flatness > 0.25:
+            tone_strength = clamp(strength + 0.15, 0.0, 1.0)
     return {
         "kind": "restore",
         "strength": strength,
@@ -265,8 +288,11 @@ def restore_model(stats, strength=0.70, restore_tone=False):
         "exposure_stops": exposure * strength,
         "wb_rg": white_rg * strength * confidence,
         "wb_bg": white_bg * strength * confidence,
-        "contrast": 1.0 + (contrast - 1.0) * strength,
-        "saturation": 1.0 + (saturation - 1.0) * strength,
+        "contrast": 1.0 + (contrast - 1.0) * tone_strength,
+        "saturation": 1.0 + (saturation - 1.0) * tone_strength,
+        "black_point": black,
+        "white_point": white,
+        "stretch": stretch,
         "source_p50": stats.get("p50", 0.0),
         "target_p50": PIVOT,
         "source_rg": stats.get("rg", 0.0),
@@ -321,21 +347,16 @@ def saturation_model(stats, strength=0.70, restore_tone=True):
     strength = clamp(_finite(strength, 0.70), 0.0, 1.0)
     contrast = 1.0
     saturation = 1.0
+    tone_strength = strength
+    black, white, stretch = 0.0, 1.0, 0.0
     if (
         restore_tone
         and _finite(stats.get("p85"), 0.0) > 0.02
         and _finite(stats.get("contrast_stops"), 0.0) > 0.20
     ):
-        contrast = clamp(
-            4.0 / max(_finite(stats.get("contrast_stops"), 4.0), 2.0),
-            1.0,
-            1.28,
-        )
-        saturation = clamp(
-            0.22 / max(_finite(stats.get("saturation"), 0.22), 0.05),
-            1.0,
-            1.22,
-        )
+        contrast, saturation, flatness = _tone_restore_factors(stats)
+        if flatness > 0.25:
+            tone_strength = clamp(strength + 0.15, 0.0, 1.0)
     return {
         "kind": "saturation",
         "strength": strength,
@@ -343,8 +364,11 @@ def saturation_model(stats, strength=0.70, restore_tone=True):
         "exposure_stops": 0.0,
         "wb_rg": 0.0,
         "wb_bg": 0.0,
-        "contrast": 1.0 + (contrast - 1.0) * strength,
-        "saturation": 1.0 + (saturation - 1.0) * strength,
+        "contrast": 1.0 + (contrast - 1.0) * tone_strength,
+        "saturation": 1.0 + (saturation - 1.0) * tone_strength,
+        "black_point": black,
+        "white_point": white,
+        "stretch": stretch,
         "source_saturation": stats.get("saturation", 0.0),
     }
 
@@ -555,6 +579,9 @@ def model_to_dctl(model, space="dwg", label=""):
     red_gain, blue_gain = _white_balance_gains(model)
     contrast = clamp(_finite(model.get("contrast"), 1.0), 0.50, 2.0)
     saturation = clamp(_finite(model.get("saturation"), 1.0), 0.0, 3.0)
+    black = clamp(_finite(model.get("black_point"), 0.0), 0.0, 1.0)
+    white = clamp(_finite(model.get("white_point"), 1.0), 0.01, 1.0)
+    stretch = clamp(_finite(model.get("stretch"), 0.0), 0.0, 1.0)
     safe_label = ascii_label(label)
     header = [
         "// ColorFlow %s" % ("DWG scene correction" if space == "dwg" else "Rec.709 correction"),
@@ -566,12 +593,15 @@ def model_to_dctl(model, space="dwg", label=""):
             contrast,
             saturation,
         ),
+        "// Tone stretch: black %.5f, white %.5f, amount %.5f"
+        % (black, white, stretch),
         "// %s" % safe_label,
         "",
         "__DEVICE__ float cf_pow(float a, float b) { return _powf(a, b); }",
         "__DEVICE__ float cf_log2(float v) { return _logf(v) / 0.69314718056f; }",
         "__DEVICE__ float cf_exp2(float v) { return _powf(2.0f, v); }",
         "__DEVICE__ float cf_max(float a, float b) { return a > b ? a : b; }",
+        "__DEVICE__ float cf_mix(float a, float b, float t) { return a + (b - a) * t; }",
         "__DEVICE__ float cf_luma(float3 rgb) { return rgb.x * 0.2126f + rgb.y * 0.7152f + rgb.z * 0.0722f; }",
         _dctl_decode_functions(space).rstrip(),
         "",
@@ -588,7 +618,27 @@ def model_to_dctl(model, space="dwg", label=""):
         "    float y = cf_luma(out);",
         "    float saturation = %.8ff;" % saturation,
         "    out = make_float3(y + (out.x - y) * saturation, y + (out.y - y) * saturation, y + (out.z - y) * saturation);",
-        "    return make_float3(cf_encode(out.x), cf_encode(out.y), cf_encode(out.z));",
+        "    float3 encoded = make_float3(cf_encode(out.x), cf_encode(out.y), cf_encode(out.z));",
+        "    float black = %.8ff;" % black,
+        "    float white = %.8ff;" % white,
+        "    float stretch = %.8ff;" % stretch,
+        "    if (stretch > 0.0001f) {",
+        "        float range = cf_max(white - black, 0.02f);",
+        "        float3 stretched = make_float3("
+        "(encoded.x - black) / range, "
+        "(encoded.y - black) / range, "
+        "(encoded.z - black) / range);",
+        "        stretched = make_float3(cf_max(stretched.x, 0.0f), cf_max(stretched.y, 0.0f), cf_max(stretched.z, 0.0f));",
+        "        stretched = make_float3("
+        "stretched.x / (1.0f + cf_max(stretched.x - 0.70f, 0.0f) * 0.5f), "
+        "stretched.y / (1.0f + cf_max(stretched.y - 0.70f, 0.0f) * 0.5f), "
+        "stretched.z / (1.0f + cf_max(stretched.z - 0.70f, 0.0f) * 0.5f));",
+        "        encoded = make_float3("
+        "cf_mix(encoded.x, stretched.x, stretch), "
+        "cf_mix(encoded.y, stretched.y, stretch), "
+        "cf_mix(encoded.z, stretched.z, stretch));",
+        "    }",
+        "    return encoded;",
         "}",
         "",
     ]

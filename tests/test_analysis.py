@@ -83,6 +83,35 @@ class AnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(model["contrast"], 1.0, places=6)
         self.assertAlmostEqual(model["saturation"], 1.0, places=6)
 
+    def test_flat_log_restore_gets_stronger_tone_lift(self):
+        flat = {
+            "p50": 0.10,
+            "p85": 0.30,
+            "p01": 0.0,
+            "p99": 0.45,
+            "contrast_stops": 2.2,
+            "saturation": 0.08,
+            "rg": 0.0,
+            "bg": 0.0,
+            "used_neutral": True,
+            "neutral_ratio": 0.05,
+        }
+        tone = analysis.saturation_model(flat, 0.70, True)
+        self.assertGreater(tone["contrast"], 1.45)
+        self.assertGreater(tone["saturation"], 1.40)
+        restored = analysis.restore_model(flat, 0.70, True)
+        self.assertGreater(restored["contrast"], 1.45)
+        self.assertGreater(restored["saturation"], 1.40)
+        self.assertEqual(restored["stretch"], 0.0)
+        self.assertEqual(restored["white_point"], 1.0)
+        dctl = analysis.model_to_dctl(restored, "dwg", "flat")
+        self.assertIn("Tone stretch", dctl)
+        self.assertIn("cf_mix", dctl)
+        normal = dict(flat, contrast_stops=4.0, saturation=0.20)
+        normal_model = analysis.saturation_model(normal, 0.70, True)
+        self.assertLess(normal_model["contrast"], 1.15)
+        self.assertLess(normal_model["saturation"], 1.15)
+
     def test_dctl_is_self_contained(self):
         stats = analysis.analyze_thumbnail(thumbnail(32, 32, (120, 100, 80)))
         model = analysis.match_model(stats, stats, 0.7)
@@ -91,7 +120,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("cf_decode", text)
         self.assertNotIn("_exp2f", text)
         self.assertNotIn("_log2f", text)
-        self.assertIn("return make_float3", text)
+        self.assertIn("return encoded", text)
 
     def test_cdl_ranges(self):
         stats = analysis.analyze_thumbnail(thumbnail(32, 32, (180, 120, 80)))

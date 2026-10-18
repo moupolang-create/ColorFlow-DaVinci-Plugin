@@ -80,7 +80,11 @@ BUTTON_TEXTS = {
     "btn_gallery_next": ("下一页", "Next"),
     "btn_apply_lut": ("套用", "Apply"),
     "btn_remove_lut": ("移除", "Remove"),
-    "btn_reference": ("拾取参考帧", "Pick Reference"),
+    "btn_reference": ("拾取当前帧", "Pick Current Frame"),
+    "btn_reference_gallery": ("从画廊引用", "From Gallery"),
+    "btn_reference_file": ("本地单帧", "Local Frame"),
+    "btn_gallery_ref_use": ("使用所选静帧", "Use Selected Still"),
+    "btn_gallery_ref_cancel": ("取消", "Cancel"),
     "btn_match": ("匹配参考色调", "Match Reference"),
     "btn_undo_match": ("撤销本次匹配", "Undo Match"),
     "btn_skin": ("生成肤色限定", "Create Skin Qualifier"),
@@ -140,6 +144,8 @@ LABEL_TEXTS = {
     "本地处理 · 不上传素材": "Local processing · no uploads",
     "运行日志": "Run Log",
     "尚未设置参考": "No reference selected",
+    "选择画廊静帧": "Select Gallery Still",
+    "没有可用的画廊静帧": "No gallery stills",
     "尚未生成报告": "No report yet",
     "还原范围": "Restore Scope",
     "分节点顺序：01 降噪 → 02 曝光 → 03 色温 → 04 饱和 → 最后空白节点留给匹配": "Node order: 01 Denoise → 02 Exposure → 03 Temperature → 04 Saturation → Last blank for match",
@@ -187,6 +193,9 @@ class ColorFlowApp(V2App):
         self._gallery_highlight_item = None
         self._gallery_highlight_entry = None
         self._gallery_selecting = False
+        self._ref_picker_win = None
+        self._ref_picker_entries = []
+        self._ref_picker_combo = None
 
     def pump(self):
         # StepLoop is useful for keeping the close button responsive, but it
@@ -233,6 +242,8 @@ class ColorFlowApp(V2App):
         self.win.On["btn_undo_match"].Clicked = self.on_undo_match
         self.win.On["btn_fix_warnings"].Clicked = self.on_fix_warnings
         self.win.On["btn_lut_gallery"].Clicked = self.on_lut_gallery
+        self.win.On["btn_reference_gallery"].Clicked = self.on_reference_gallery
+        self.win.On["btn_reference_file"].Clicked = self.on_reference_file
         lang = self._find("lang_combo")
         lang.Clear()
         lang.AddItems(["中文", "English"])
@@ -254,6 +265,8 @@ class ColorFlowApp(V2App):
         try:
             if self._gallery_win is not None:
                 self.on_gallery_close(None)
+            if self._ref_picker_win is not None:
+                self.on_reference_picker_close(None)
             lang = self.language
             for widget_id, (zh, en) in BUTTON_TEXTS.items():
                 widget = self._find(widget_id)
@@ -514,6 +527,12 @@ class ColorFlowApp(V2App):
             except Exception:
                 pass
             self._release_gallery_refs()
+        if self._ref_picker_win is not None:
+            try:
+                self._ref_picker_win.Hide()
+            except Exception:
+                pass
+            self._ref_picker_win = None
         super().on_close(event)
 
     def _open_lut_gallery(self):
@@ -1391,8 +1410,10 @@ class ColorFlowApp(V2App):
                 self.ui.HGroup(
                     {"Spacing": 6, "MaximumSize": [880, 34]},
                     [
-                        self.ui.Button({"ID": "btn_reference", "Text": "拾取参考帧", "MinimumSize": [110, 32]}),
-                        self.ui.Label({"ID": "reference_info", "Text": "尚未设置参考", "WordWrap": True, "MaximumSize": [600, 34]}),
+                        self.ui.Button({"ID": "btn_reference", "Text": "拾取当前帧", "MinimumSize": [110, 32]}),
+                        self.ui.Button({"ID": "btn_reference_gallery", "Text": "从画廊引用", "MinimumSize": [110, 32]}),
+                        self.ui.Button({"ID": "btn_reference_file", "Text": "本地单帧", "MinimumSize": [95, 32]}),
+                        self.ui.Label({"ID": "reference_info", "Text": "尚未设置参考", "WordWrap": True, "MaximumSize": [420, 34]}),
                     ],
                 ),
                 self.ui.HGroup(
@@ -1718,6 +1739,186 @@ class ColorFlowApp(V2App):
             self._update_match_visual()
         except Exception:
             pass
+
+    def _set_match_reference(self, reference):
+        self.reference = reference
+        self._set(
+            "reference_info",
+            self._t(
+                "参考：%s（已锁定）", "Reference: %s (locked)"
+            )
+            % reference.get("name", ""),
+            "#6ee7b7",
+        )
+        self._update_match_visual()
+        self._log(
+            "参考已锁定：%s｜%s"
+            % (
+                reference.get("name", ""),
+                analysis.describe_stats(reference["stats"]),
+            )
+        )
+
+    @_guarded
+    def on_reference_gallery(self, event):
+        try:
+            context = self._require_clip()
+            entries = features.list_gallery_stills(context["project"])
+            if not entries:
+                raise rb.ColorFlowError(
+                    "画廊里没有静帧。请先在 Color 页面抓取静帧，"
+                    "或使用“本地单帧”。"
+                )
+            if len(entries) == 1:
+                self._use_gallery_reference(entries[0])
+                return
+            self._open_reference_picker(entries)
+        except Exception as exc:
+            self._set(
+                "reference_info",
+                self._t("读取画廊失败：%s", "Gallery read failed: %s") % exc,
+                "#f87171",
+            )
+            self._log("读取画廊失败：%s" % exc)
+
+    @_guarded
+    def on_reference_file(self, event):
+        try:
+            path = self.fusion.RequestFile()
+            if not path:
+                return
+            self._set(
+                "reference_info",
+                self._t("正在载入本地参考…", "Loading local reference…"),
+                "#fbbf24",
+            )
+            self.pump()
+            context = self._require_clip()
+            reference = features.reference_from_local_file(
+                context["project"], str(path)
+            )
+            self._set_match_reference(reference)
+        except Exception as exc:
+            self._set(
+                "reference_info",
+                self._t("载入本地参考失败：%s", "Local reference failed: %s")
+                % exc,
+                "#f87171",
+            )
+            self._log("载入本地参考失败：%s" % exc)
+
+    def _use_gallery_reference(self, entry):
+        try:
+            self._set(
+                "reference_info",
+                self._t("正在读取画廊静帧…", "Loading gallery still…"),
+                "#fbbf24",
+            )
+            self.pump()
+            context = self._require_clip()
+            reference = features.reference_from_gallery_still(
+                context["project"], entry
+            )
+            self._set_match_reference(reference)
+        except Exception as exc:
+            self._set(
+                "reference_info",
+                self._t("载入画廊静帧失败：%s", "Gallery still failed: %s")
+                % exc,
+                "#f87171",
+            )
+            self._log("载入画廊静帧失败：%s" % exc)
+
+    def _open_reference_picker(self, entries):
+        if self._ref_picker_win is not None:
+            self._ref_picker_win.Show()
+            self._ref_picker_win.Raise()
+            return
+        picker_id = self.window_id + ".refpick"
+        self._ref_picker_entries = entries
+        self._ref_picker_combo = self.ui.ComboBox(
+            {
+                "ID": "gallery_ref_pick",
+                "ItemText": [entry["label"] for entry in entries],
+                "CurrentIndex": 0,
+                "MinimumSize": [540, 32],
+            }
+        )
+        use_button = self.ui.Button(
+            {
+                "ID": "btn_gallery_ref_use",
+                "Text": self._t("使用所选静帧", "Use Selected Still"),
+                "MinimumSize": [130, 32],
+                "StyleSheet": TAB_ACTIVE,
+            }
+        )
+        cancel_button = self.ui.Button(
+            {
+                "ID": "btn_gallery_ref_cancel",
+                "Text": self._t("取消", "Cancel"),
+                "MinimumSize": [80, 32],
+            }
+        )
+        root = self.ui.VGroup(
+            {"Spacing": 10},
+            [
+                self.ui.Label(
+                    {
+                        "Text": self._t(
+                            "选择画廊静帧", "Select Gallery Still"
+                        ),
+                        "StyleSheet": "color:#22d3ee;font-size:13pt;font-weight:700;",
+                    }
+                ),
+                self._ref_picker_combo,
+                self.ui.HGroup(
+                    {"Spacing": 8},
+                    [
+                        use_button,
+                        cancel_button,
+                        self.ui.HGap(0, 1),
+                    ],
+                ),
+            ],
+        )
+        picker = self.dispatcher.AddWindow(
+            {
+                "ID": picker_id,
+                "Geometry": [420, 260, 600, 180],
+                "WindowTitle": self._t("ColorFlow · 选择静帧", "ColorFlow · Select Still"),
+                "StyleSheet": STYLE,
+            },
+            root,
+        )
+        self._ref_picker_win = picker
+        picker.On[picker_id].Close = self.on_reference_picker_close
+        picker.On["btn_gallery_ref_use"].Clicked = self.on_reference_picker_use
+        picker.On["btn_gallery_ref_cancel"].Clicked = self.on_reference_picker_close
+        picker.Show()
+        picker.Raise()
+
+    def on_reference_picker_use(self, event):
+        try:
+            index = int(self._ref_picker_combo.CurrentIndex)
+            entry = self._ref_picker_entries[index]
+        except Exception:
+            entry = None
+        if self._ref_picker_win is not None:
+            try:
+                self._ref_picker_win.Hide()
+            except Exception:
+                pass
+            self._ref_picker_win = None
+        if entry is not None:
+            self._use_gallery_reference(entry)
+
+    def on_reference_picker_close(self, event):
+        if self._ref_picker_win is not None:
+            try:
+                self._ref_picker_win.Hide()
+            except Exception:
+                pass
+            self._ref_picker_win = None
 
     @_guarded
     def on_match(self, event):

@@ -5,6 +5,7 @@ import struct
 import tempfile
 import time
 import zlib
+from pathlib import Path
 
 from . import analysis
 from . import resolve_bridge as rb
@@ -35,6 +36,126 @@ def write_png(path, width, height, rgb):
     )
     with open(path, "wb") as handle:
         handle.write(payload)
+
+
+def _paeth(left, above, upper_left):
+    value = left + above - upper_left
+    left_delta = abs(value - left)
+    above_delta = abs(value - above)
+    upper_left_delta = abs(value - upper_left)
+    if left_delta <= above_delta and left_delta <= upper_left_delta:
+        return left
+    if above_delta <= upper_left_delta:
+        return above
+    return upper_left
+
+
+def read_png_rgb(path):
+    """Read a non-interlaced PNG and return (width, height, rgb_bytes)."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("不是有效的 PNG 文件。")
+    pos = 8
+    width = height = None
+    bit_depth = color_type = 0
+    interlace = 0
+    palette = None
+    compressed = bytearray()
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        tag = data[pos + 4 : pos + 8]
+        chunk = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if tag == b"IHDR":
+            (
+                width,
+                height,
+                bit_depth,
+                color_type,
+                compression,
+                filter_method,
+                interlace,
+            ) = struct.unpack(">IIBBBBB", chunk)
+        elif tag == b"PLTE":
+            palette = chunk
+        elif tag == b"IDAT":
+            compressed.extend(chunk)
+        elif tag == b"IEND":
+            break
+    if not width or not height:
+        raise ValueError("PNG 缺少有效尺寸。")
+    if interlace:
+        raise ValueError("暂不支持隔行 PNG，请另存为标准 PNG。")
+    if bit_depth not in (8, 16):
+        raise ValueError("暂不支持 %d-bit PNG。" % bit_depth)
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
+    if channels is None:
+        raise ValueError("暂不支持该 PNG 颜色类型。")
+    sample_bytes = bit_depth // 8
+    row_bytes = width * channels * sample_bytes
+    raw = zlib.decompress(bytes(compressed))
+    expected = height * (row_bytes + 1)
+    if len(raw) < expected:
+        raise ValueError("PNG 像素数据不完整。")
+    rows = []
+    previous = bytearray(row_bytes)
+    offset = 0
+    for _ in range(height):
+        filter_type = raw[offset]
+        offset += 1
+        row = bytearray(raw[offset : offset + row_bytes])
+        offset += row_bytes
+        if filter_type == 1:
+            for index in range(row_bytes):
+                left = row[index - channels * sample_bytes] if index >= channels * sample_bytes else 0
+                row[index] = (row[index] + left) & 0xFF
+        elif filter_type == 2:
+            for index in range(row_bytes):
+                row[index] = (row[index] + previous[index]) & 0xFF
+        elif filter_type == 3:
+            for index in range(row_bytes):
+                left = row[index - channels * sample_bytes] if index >= channels * sample_bytes else 0
+                row[index] = (
+                    row[index] + ((left + previous[index]) // 2)
+                ) & 0xFF
+        elif filter_type == 4:
+            for index in range(row_bytes):
+                left = row[index - channels * sample_bytes] if index >= channels * sample_bytes else 0
+                upper_left = (
+                    previous[index - channels * sample_bytes]
+                    if index >= channels * sample_bytes
+                    else 0
+                )
+                row[index] = (
+                    row[index]
+                    + _paeth(left, previous[index], upper_left)
+                ) & 0xFF
+        elif filter_type != 0:
+            raise ValueError("PNG 使用了未知行过滤器。")
+        rows.append(bytes(row))
+        previous = row
+    rgb = bytearray(width * height * 3)
+    target = 0
+    for row in rows:
+        for x in range(width):
+            index = x * channels * sample_bytes
+            if color_type == 3:
+                palette_index = row[index]
+                if palette is None or palette_index * 3 + 2 >= len(palette):
+                    raise ValueError("PNG 调色板数据不完整。")
+                red = palette[palette_index * 3]
+                green = palette[palette_index * 3 + 1]
+                blue = palette[palette_index * 3 + 2]
+            elif color_type in (0, 4):
+                red = green = blue = row[index]
+            else:
+                red = row[index]
+                green = row[index + sample_bytes]
+                blue = row[index + 2 * sample_bytes]
+            rgb[target : target + 3] = bytes((red, green, blue))
+            target += 3
+    return width, height, bytes(rgb)
 
 
 def thumbnail_to_png(thumbnail, path, width=360, height=203):
@@ -102,6 +223,6 @@ def export_current_frame(project, tag="current", extension=".jpg"):
 def preview_html(path, width):
     if not path:
         return '<span style="color:#6d7c8e;">无预览</span>'
-    url = "file:///" + os.path.abspath(path).replace("\\", "/")
+    url = Path(os.path.abspath(path)).as_uri()
     return '<img src="%s" width="%d">' % (url, width)
 

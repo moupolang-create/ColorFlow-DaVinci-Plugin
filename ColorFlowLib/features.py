@@ -3,14 +3,17 @@
 import glob
 import hashlib
 import html
+import base64
 import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from datetime import datetime
 
 from . import analysis
+from . import preview
 from . import resolve_bridge as rb
 from .timeline_tools import parse_fps, parse_resolution
 
@@ -24,6 +27,8 @@ LABELED_TEMPLATE_DIR = os.path.join(TEMPLATE_DIR, ".labeled")
 BACKUP_DIR = os.path.join(DOCUMENTS, "Backups")
 LAST_BATCH_PATH = os.path.join(BACKUP_DIR, "last_batch.json")
 INDEX_PATH = os.path.join(PRESET_DIR, "index.json")
+REFERENCE_DIR = os.path.join(tempfile.gettempdir(), "ColorFlow", "reference")
+GALLERY_REFERENCE_ALBUM = "ColorFlow References"
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROGRAM_DATA = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
 GRADEPILOT_TEMPLATE = os.path.join(
@@ -871,6 +876,116 @@ def apply_template(project, clip, path, label_nodes=False):
     if nodes < 3:
         raise rb.ColorFlowError("模板套用后节点数异常：%d" % nodes)
     return nodes
+
+
+def _export_still_png(album, still, prefix):
+    os.makedirs(REFERENCE_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    prefix = "%s_%s" % (prefix, stamp)
+    before = set(glob.glob(os.path.join(REFERENCE_DIR, prefix + "*.png")))
+    if not album.ExportStills([still], REFERENCE_DIR, prefix, "png"):
+        raise rb.ColorFlowError("Resolve 未能导出参考静帧。")
+    after = set(glob.glob(os.path.join(REFERENCE_DIR, prefix + "*.png")))
+    created = sorted(after - before, key=os.path.getmtime)
+    if not created:
+        candidates = sorted(
+            glob.glob(os.path.join(REFERENCE_DIR, prefix + "*.png")),
+            key=os.path.getmtime,
+        )
+        if candidates:
+            created = [candidates[-1]]
+    if not created or not os.path.isfile(created[-1]):
+        raise rb.ColorFlowError("没有找到导出的参考静帧。")
+    return created[-1]
+
+
+def _reference_from_png(path, name, source):
+    width, height, rgb = preview.read_png_rgb(path)
+    return {
+        "name": name,
+        "stats": analysis.analyze_pixels(width, height, rgb, 3),
+        "clip_id": None,
+        "thumbnail": {
+            "width": width,
+            "height": height,
+            "data": base64.b64encode(rgb).decode("ascii"),
+        },
+        "preview": path,
+        "source": source,
+    }
+
+
+def list_gallery_stills(project):
+    """Return selectable gallery stills with album names and display labels."""
+    gallery = project.GetGallery()
+    if gallery is None:
+        raise rb.ColorFlowError("当前项目没有画廊。")
+    entries = []
+    for album in gallery.GetGalleryStillAlbums() or []:
+        stills = album.GetStills() or []
+        if not stills:
+            continue
+        album_name = gallery.GetAlbumName(album) or "相册"
+        for index, still in enumerate(stills, 1):
+            entries.append(
+                {
+                    "album": album,
+                    "album_name": album_name,
+                    "index": index,
+                    "still": still,
+                    "label": "%s · 静帧 %d" % (album_name, index),
+                }
+            )
+    return entries
+
+
+def reference_from_gallery_still(project, entry):
+    path = _export_still_png(entry["album"], entry["still"], "gallery")
+    name = "%s / 静帧 %d" % (entry["album_name"], entry["index"])
+    return _reference_from_png(path, name, "gallery")
+
+
+def _reference_album(gallery):
+    for album in gallery.GetGalleryStillAlbums() or []:
+        if gallery.GetAlbumName(album) == GALLERY_REFERENCE_ALBUM:
+            return album
+    album = gallery.CreateGalleryStillAlbum()
+    if album is None:
+        raise rb.ColorFlowError("无法创建参考静帧相册。")
+    gallery.SetAlbumName(album, GALLERY_REFERENCE_ALBUM)
+    return album
+
+
+def reference_from_local_file(project, file_path):
+    if not file_path or not os.path.isfile(file_path):
+        raise rb.ColorFlowError("参考画面文件不存在。")
+    gallery = project.GetGallery()
+    if gallery is None:
+        raise rb.ColorFlowError("当前项目没有画廊。")
+    album = _reference_album(gallery)
+    current = gallery.GetCurrentStillAlbum()
+    try:
+        gallery.SetCurrentStillAlbum(album)
+        before = len(album.GetStills() or [])
+        if not album.ImportStills([file_path]):
+            raise rb.ColorFlowError("Resolve 未能导入这张参考图。")
+        stills = album.GetStills() or []
+        if len(stills) <= before:
+            raise rb.ColorFlowError("导入后没有找到参考静帧。")
+        still = stills[-1]
+    finally:
+        try:
+            if current is not None:
+                gallery.SetCurrentStillAlbum(current)
+        except Exception:
+            pass
+    label = os.path.splitext(os.path.basename(file_path))[0]
+    try:
+        album.SetLabel(still, label)
+    except Exception:
+        pass
+    path = _export_still_png(album, still, "local")
+    return _reference_from_png(path, "本地：%s" % label, "local")
 
 
 def report_timeline(project, timeline, progress=None):

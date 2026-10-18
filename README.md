@@ -1,6 +1,6 @@
 # ColorFlow v3 · 达芬奇调色助手
 
-当前版本：**1.2.0**（2026-10-18） · 更新记录：[CHANGELOG.md](CHANGELOG.md)
+当前版本：**1.2.1**（2026-10-18） · 更新记录：[CHANGELOG.md](CHANGELOG.md)
 
 按“先看懂素材、再做技术归一、再做参考匹配、最后批量和 QC”的思路重构的 DaVinci Resolve Studio 面板。界面使用扁平单列布局，并带真实缩略图预览。
 

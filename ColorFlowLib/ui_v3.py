@@ -2051,8 +2051,9 @@ class ColorFlowApp(V2App):
                     analysis.describe_model(model),
                 )
             )
-            self._save(context)
-            self.refresh_nodes()
+            self.refresh_analysis()
+            self.result_preview = getattr(self, "target_preview", None)
+            self._update_match_visual()
             self._set(
                 "primary_status",
                 self._t(
@@ -2148,8 +2149,9 @@ class ColorFlowApp(V2App):
                     writes[2][1]["contrast"],
                 )
             )
-            self._save(context)
-            self.refresh_nodes()
+            self.refresh_analysis()
+            self.result_preview = getattr(self, "target_preview", None)
+            self._update_match_visual()
             template_note = (
                 self._t(
                     "模板 %s，" % template_used,

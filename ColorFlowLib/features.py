@@ -963,22 +963,13 @@ def reference_from_local_file(project, file_path):
     if gallery is None:
         raise rb.ColorFlowError("当前项目没有画廊。")
     album = _reference_album(gallery)
-    current = gallery.GetCurrentStillAlbum()
-    try:
-        gallery.SetCurrentStillAlbum(album)
-        before = len(album.GetStills() or [])
-        if not album.ImportStills([file_path]):
-            raise rb.ColorFlowError("Resolve 未能导入这张参考图。")
-        stills = album.GetStills() or []
-        if len(stills) <= before:
-            raise rb.ColorFlowError("导入后没有找到参考静帧。")
-        still = stills[-1]
-    finally:
-        try:
-            if current is not None:
-                gallery.SetCurrentStillAlbum(current)
-        except Exception:
-            pass
+    before = len(album.GetStills() or [])
+    if not album.ImportStills([file_path]):
+        raise rb.ColorFlowError("Resolve 未能导入这张参考图。")
+    stills = album.GetStills() or []
+    if len(stills) <= before:
+        raise rb.ColorFlowError("导入后没有找到参考静帧。")
+    still = stills[-1]
     label = os.path.splitext(os.path.basename(file_path))[0]
     try:
         album.SetLabel(still, label)
